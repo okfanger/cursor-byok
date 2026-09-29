@@ -148,10 +148,18 @@ pub(crate) async fn prepare(
         .filter(|kind| !kind.is_empty())
     {
         // BYOK subagent routing: the saved route wins over the model Cursor
-        // requested for this subagent kind. The routed model may be a plugin
-        // model id with no row in the built-in model table; in that case the
-        // requested model's configured attributes stay in effect.
-        if let Some(routed_model_id) = store.subagent_routes().await?.routes.get(kind).cloned() {
+        // requested for this subagent kind. Matching is case-insensitive
+        // because Cursor displays agent names in title case ("Explorer")
+        // while the Task tool schema uses lowercase ids ("explore"). The
+        // routed model may be a plugin model id with no row in the built-in
+        // model table; in that case the requested model's configured
+        // attributes stay in effect.
+        let routes = store.subagent_routes().await?.routes;
+        if let Some(routed_model_id) = routes
+            .iter()
+            .find(|(saved, _)| saved.eq_ignore_ascii_case(kind))
+            .map(|(_, model_id)| model_id.clone())
+        {
             model.model_id = routed_model_id;
             model.display_name = None;
         }

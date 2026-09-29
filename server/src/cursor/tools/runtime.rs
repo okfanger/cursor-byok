@@ -74,6 +74,16 @@ impl ExecContext {
             .unwrap_or("generalPurpose")
     }
 
+    /// Overrides are keyed by the subagent type as Cursor reports it, while
+    /// Task calls use the lowercase ids from the tool schema; match
+    /// case-insensitively so "Explorer" and "explore" find the same entry.
+    fn subagent_model_for(&self, kind: &str) -> Option<&SubagentModel> {
+        self.subagent_models
+            .iter()
+            .find(|(saved, _)| saved.eq_ignore_ascii_case(kind))
+            .map(|(_, model)| model)
+    }
+
     pub fn task_disabled(&self, call: &ToolCall) -> bool {
         if !call.name.eq_ignore_ascii_case("Task") {
             return false;
@@ -82,7 +92,7 @@ impl ExecContext {
             return true;
         }
         matches!(
-            self.subagent_models.get(self.task_subagent_kind(call)),
+            self.subagent_model_for(self.task_subagent_kind(call)),
             Some(SubagentModel::Disabled)
         )
     }
@@ -99,7 +109,7 @@ impl ExecContext {
         if self.task_disabled(call) {
             return Ok(call.clone());
         }
-        let model = match self.subagent_models.get(&subagent_type) {
+        let model = match self.subagent_model_for(&subagent_type) {
             Some(SubagentModel::Model(model)) => model.clone(),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
             None => arguments
@@ -463,5 +473,19 @@ mod tests {
         assert!(!context.task_disabled(&task_call(json!({
             "subagent_type": "review"
         }))));
+    }
+
+    #[test]
+    fn override_kind_matching_ignores_case() {
+        let context = exec_context(vec![("Explore", SubagentModel::Model("model-a".into()))]);
+
+        let prepared = context
+            .prepare_call(&task_call(json!({
+                "subagent_type": "explore",
+                "model": "requested-model"
+            })))
+            .expect("call should prepare");
+
+        assert_eq!(prepared.arguments["model"], "model-a");
     }
 }
