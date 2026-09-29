@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{
     CommitPromptLocale, CommitSettings, DesktopSettings, PortSettings, ProxySettings,
-    ProxySettingsInput, StatisticsStorage, StatisticsStorageScope, TabSettings,
-    TokenPricingSettings,
+    ProxySettingsInput, StatisticsStorage, StatisticsStorageScope, SubagentRouteSettings,
+    TabSettings, TokenPricingSettings,
 };
 
 use super::{ControlService, ObservabilitySettings};
@@ -133,6 +133,19 @@ pub async fn update_commit(
     let saved = service.set_commit_settings(settings).await?;
     let default_locale = saved.prompt_locale;
     Ok(Json(CommitSettingsView::new(saved, default_locale)))
+}
+
+pub async fn get_subagent_routes(
+    State(service): State<ControlService>,
+) -> Result<Json<SubagentRouteSettings>> {
+    Ok(Json(service.subagent_routes().await?))
+}
+
+pub async fn update_subagent_routes(
+    State(service): State<ControlService>,
+    Json(settings): Json<SubagentRouteSettings>,
+) -> Result<Json<SubagentRouteSettings>> {
+    Ok(Json(service.set_subagent_routes(settings).await?))
 }
 
 pub async fn get_pricing_settings(

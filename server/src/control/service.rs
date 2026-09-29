@@ -25,11 +25,13 @@ use crate::{
         ModelRequest, ModelSpec, ModelType, Overview, ProjectedContent, ProjectedMessage,
         PromptSpec, ProviderType, Role,
     },
-    plugin::{PluginDescriptor, PluginRegistry, PluginRuntime, PluginRuntimeStatus},
+    plugin::{
+        PluginDescriptor, PluginRegistry, PluginRuntime, PluginRuntimeStatus, ADAPTER_ID_PREFIX,
+    },
     provider::{is_valid_response_event, ModelEvent, Provider},
     store::{
         CommitSettings, DesktopSettings, PortSettings, ProxySettings, ProxySettingsInput,
-        StatisticsStorage, Store, TabSettings, TokenPricingSettings,
+        StatisticsStorage, Store, SubagentRouteSettings, TabSettings, TokenPricingSettings,
     },
     Error, Result,
 };
@@ -747,6 +749,34 @@ impl ControlService {
 
     pub async fn set_commit_settings(&self, settings: CommitSettings) -> Result<CommitSettings> {
         self.store.set_commit_settings(settings).await
+    }
+
+    pub async fn subagent_routes(&self) -> Result<SubagentRouteSettings> {
+        self.store.subagent_routes().await
+    }
+
+    /// Persists subagent routes after validating that every route model is
+    /// configured: built-in models resolve through the model table and plugin
+    /// models through the plugin registry, matching Commit model validation.
+    pub async fn set_subagent_routes(
+        &self,
+        settings: SubagentRouteSettings,
+    ) -> Result<SubagentRouteSettings> {
+        for (kind, model_id) in &settings.routes {
+            if kind.trim().is_empty() {
+                return Err(Error::Config(
+                    "subagent route kind must not be empty".into(),
+                ));
+            }
+            if model_id.starts_with(ADAPTER_ID_PREFIX) {
+                self.plugins.model_descriptor(model_id).await?;
+            } else if self.store.model(model_id).await?.is_none() {
+                return Err(Error::Config(format!(
+                    "subagent route model {model_id} is not configured; select a configured model"
+                )));
+            }
+        }
+        self.store.set_subagent_routes(settings).await
     }
 
     pub async fn pricing_settings(&self) -> Result<TokenPricingSettings> {

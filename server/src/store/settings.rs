@@ -1,5 +1,6 @@
 //! Persists application settings.
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 
 use crate::Result;
 
@@ -11,6 +12,7 @@ const TAB_SETTINGS_KEY: &str = "cursor_tab";
 const INSTALLATION_ID_KEY: &str = "installation_id";
 const DESKTOP_SETTINGS_KEY: &str = "desktop_lifecycle";
 const COMMIT_SETTINGS_KEY: &str = "commit_settings";
+const SUBAGENT_ROUTES_SETTINGS_KEY: &str = "subagent_routes";
 const CURSOR_TAKEOVER_ENABLED_KEY: &str = "cursor_takeover_enabled";
 const PRICING_SETTINGS_KEY: &str = "token_pricing";
 
@@ -166,6 +168,20 @@ impl CommitSettings {
             trimmed
         }
     }
+}
+
+/// Routes Cursor subagent runs to configured BYOK models by subagent kind.
+///
+/// The key is the Cursor subagent type (`generalPurpose`, `explore`, a custom
+/// `.cursor/agents/*.md` name, ...). The value is the stable identifier of a
+/// configured built-in or plugin model. When a run carries a subagent type
+/// with an entry here, the server replaces the requested model before
+/// provider dispatch; models deleted after the route was saved fall back to
+/// the Cursor-requested model at run time.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SubagentRouteSettings {
+    #[serde(default)]
+    pub routes: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -462,6 +478,46 @@ impl Store {
         Ok(settings)
     }
 
+    pub async fn subagent_routes(&self) -> Result<SubagentRouteSettings> {
+        let value = sqlx::query_scalar::<_, String>(
+            "SELECT value_json FROM service_settings WHERE setting_key = ?",
+        )
+        .bind(SUBAGENT_ROUTES_SETTINGS_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or_else(|| Ok(SubagentRouteSettings::default()))
+    }
+
+    /// Persists subagent routes after trimming keys and values. Entries whose
+    /// kind or model identifier is empty are dropped rather than rejected: an
+    /// empty model means "no route" for that kind.
+    pub async fn set_subagent_routes(
+        &self,
+        settings: SubagentRouteSettings,
+    ) -> Result<SubagentRouteSettings> {
+        let normalized = SubagentRouteSettings {
+            routes: settings
+                .routes
+                .into_iter()
+                .map(|(kind, model_id)| (kind.trim().to_owned(), model_id.trim().to_owned()))
+                .filter(|(kind, model_id)| !kind.is_empty() && !model_id.is_empty())
+                .collect(),
+        };
+        let value_json = serde_json::to_string(&normalized)?;
+        let _write = self.writes.lock().await;
+        sqlx::query(
+            "INSERT INTO service_settings(setting_key, value_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+        )
+        .bind(SUBAGENT_ROUTES_SETTINGS_KEY)
+        .bind(value_json)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(normalized)
+    }
+
     pub async fn pricing_settings(&self) -> Result<TokenPricingSettings> {
         let value = sqlx::query_scalar::<_, String>(
             "SELECT value_json FROM service_settings WHERE setting_key = ?",
@@ -496,9 +552,10 @@ impl Store {
 mod tests {
     use super::{
         read_proxy_settings, CommitPromptLocale, CommitSettings, ProxyMode, ProxySettingsInput,
-        ProxySettingsSecret, Store, TokenPricingSettings, DEFAULT_COMMIT_PROMPT_EN_US,
-        DEFAULT_COMMIT_PROMPT_ZH_CN, PROXY_SETTINGS_KEY,
+        ProxySettingsSecret, Store, SubagentRouteSettings, TokenPricingSettings,
+        DEFAULT_COMMIT_PROMPT_EN_US, DEFAULT_COMMIT_PROMPT_ZH_CN, PROXY_SETTINGS_KEY,
     };
+    use std::collections::BTreeMap;
 
     /// The `outbound_proxy` row exactly as builds before the `system` -> `default`
     /// rename wrote it.
@@ -631,5 +688,63 @@ mod tests {
         assert_eq!(saved, custom);
 
         assert_eq!(store.pricing_settings().await.unwrap(), custom);
+    }
+
+    #[tokio::test]
+    async fn subagent_routes_persist_and_replace_wholesale() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+
+        assert_eq!(
+            store.subagent_routes().await.unwrap(),
+            SubagentRouteSettings::default()
+        );
+
+        let saved = store
+            .set_subagent_routes(SubagentRouteSettings {
+                routes: BTreeMap::from([
+                    ("explore".into(), "model-a-hash".into()),
+                    ("review".into(), "plugin:model-b".into()),
+                ]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.routes.len(), 2);
+        assert_eq!(store.subagent_routes().await.unwrap(), saved);
+
+        // A save replaces the whole table; a removed kind disappears.
+        let saved = store
+            .set_subagent_routes(SubagentRouteSettings {
+                routes: BTreeMap::from([("explore".into(), "model-a-hash".into())]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.subagent_routes().await.unwrap(), saved);
+        assert!(!saved.routes.contains_key("review"));
+    }
+
+    #[tokio::test]
+    async fn subagent_routes_drop_blank_entries_and_trim() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+
+        let saved = store
+            .set_subagent_routes(SubagentRouteSettings {
+                routes: BTreeMap::from([
+                    ("  explore  ".into(), "  model-a-hash  ".into()),
+                    ("review".into(), String::new()),
+                    ("   ".into(), "model-b-hash".into()),
+                ]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            saved.routes,
+            BTreeMap::from([("explore".into(), "model-a-hash".into())])
+        );
+        assert_eq!(store.subagent_routes().await.unwrap(), saved);
     }
 }

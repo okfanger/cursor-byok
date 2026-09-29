@@ -1,10 +1,9 @@
 //! Resolves Cursor model selections to configured provider models.
+use std::collections::HashMap;
+
 use crate::{
     cursor::protocol::proto::agent::v1 as pb,
-    model::{
-        parse_token_count, ModelLatency, ModelSpec, ReasoningSpec, SubagentKind,
-        SubagentModelOverride,
-    },
+    model::{parse_token_count, ModelLatency, ModelSpec, ReasoningSpec, SubagentModelOverride},
     Error, Result,
 };
 
@@ -37,44 +36,38 @@ pub fn requested_model(request: &pb::AgentRunRequest) -> Result<ModelSpec> {
     Ok(model)
 }
 
-pub fn overrides(
-    request: &pb::AgentRunRequest,
-) -> Result<Vec<(SubagentKind, SubagentModelOverride)>> {
-    request
-        .subagent_model_overrides
-        .iter()
-        .map(|value| {
-            use pb::subagent_model_override::Selection;
-            let kind = subagent_kind(&value.subagent_type);
-            let selection = match value.selection.as_ref() {
-                Some(Selection::Model(model)) => {
-                    if model.model_id == "default" {
-                        SubagentModelOverride::Inherit
-                    } else {
-                        SubagentModelOverride::Explicit(from_requested(model, None)?)
-                    }
+pub fn overrides(request: &pb::AgentRunRequest) -> Result<HashMap<String, SubagentModelOverride>> {
+    let mut overrides = HashMap::new();
+    for value in &request.subagent_model_overrides {
+        use pb::subagent_model_override::Selection;
+        let selection = match value.selection.as_ref() {
+            Some(Selection::Model(model)) => {
+                if model.model_id == "default" {
+                    SubagentModelOverride::Inherit
+                } else {
+                    SubagentModelOverride::Explicit(from_requested(model, None)?)
                 }
-                Some(Selection::Inherit(true)) => SubagentModelOverride::Inherit,
-                Some(Selection::Disabled(true)) => SubagentModelOverride::Disabled,
-                None | Some(Selection::Inherit(false) | Selection::Disabled(false)) => {
-                    return Err(Error::Protocol(format!(
-                        "Cursor subagent model override {} has no active selection",
-                        value.subagent_type
-                    )))
-                }
-            };
-            Ok((kind, selection))
-        })
-        .collect()
+            }
+            Some(Selection::Inherit(true)) => SubagentModelOverride::Inherit,
+            Some(Selection::Disabled(true)) => SubagentModelOverride::Disabled,
+            None | Some(Selection::Inherit(false) | Selection::Disabled(false)) => {
+                return Err(Error::Protocol(format!(
+                    "Cursor subagent model override {} has no active selection",
+                    value.subagent_type
+                )))
+            }
+        };
+        // An absent subagent type denotes the general-purpose subagent.
+        let kind = match value.subagent_type.trim() {
+            "" => GENERAL_PURPOSE_SUBAGENT.to_owned(),
+            kind => kind.to_owned(),
+        };
+        overrides.insert(kind, selection);
+    }
+    Ok(overrides)
 }
 
-pub fn subagent_kind(value: &str) -> SubagentKind {
-    if value == "generalPurpose" {
-        SubagentKind::GeneralPurpose
-    } else {
-        SubagentKind::Named(value.into())
-    }
-}
+pub const GENERAL_PURPOSE_SUBAGENT: &str = "generalPurpose";
 
 fn from_requested(
     model: &pb::RequestedModel,
@@ -156,5 +149,36 @@ mod tests {
         assert_eq!(model.model_id, "test-model");
         assert_eq!(model.latency, ModelLatency::Standard);
         assert!(!model.reasoning.enabled);
+    }
+
+    #[test]
+    fn overrides_key_by_subagent_type_and_resolve_selections() {
+        let request = pb::AgentRunRequest {
+            subagent_model_overrides: vec![
+                pb::SubagentModelOverride {
+                    subagent_type: "explore".into(),
+                    selection: Some(pb::subagent_model_override::Selection::Model(
+                        pb::RequestedModel {
+                            model_id: "model-a".into(),
+                            ..Default::default()
+                        },
+                    )),
+                },
+                pb::SubagentModelOverride {
+                    subagent_type: String::new(),
+                    selection: Some(pb::subagent_model_override::Selection::Disabled(true)),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let overrides = overrides(&request).expect("overrides should resolve");
+
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(
+            overrides["explore"],
+            SubagentModelOverride::Explicit(ModelSpec::new("model-a"))
+        );
+        assert_eq!(overrides["generalPurpose"], SubagentModelOverride::Disabled);
     }
 }

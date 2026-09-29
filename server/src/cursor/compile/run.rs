@@ -141,16 +141,32 @@ pub(crate) async fn prepare(
         mode_from_proto(mode_number)?
     };
     let mut model = model::requested_model(request)?;
+    if let Some(kind) = request
+        .subagent_type_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        // BYOK subagent routing: the saved route wins over the model Cursor
+        // requested for this subagent kind. The routed model may be a plugin
+        // model id with no row in the built-in model table; in that case the
+        // requested model's configured attributes stay in effect.
+        if let Some(routed_model_id) = store.subagent_routes().await?.routes.get(kind).cloned() {
+            model.model_id = routed_model_id;
+            model.display_name = None;
+        }
+    }
     if let Some(configured_model) = store.model(&model.model_id).await? {
         configured_model.configure(&mut model);
     }
     let dynamic = context::dynamic_mcp(request, &request_context)?;
     let subagent_model_overrides = model::overrides(request)?;
-    let subagents_disabled = subagent_model_overrides
-        .first()
-        .is_some_and(|(_, selection)| {
-            matches!(selection, crate::model::SubagentModelOverride::Disabled)
-        });
+    // A Disabled selection applies to its own subagent kind; every override
+    // being Disabled is the Cursor "no subagents" signal that strips Task.
+    let subagents_disabled = !subagent_model_overrides.is_empty()
+        && subagent_model_overrides
+            .values()
+            .all(|selection| matches!(selection, crate::model::SubagentModelOverride::Disabled));
     let mut checkpoint_prompt = compiler.prompt_spec(
         checkpoint_mode,
         &model,
@@ -597,18 +613,23 @@ fn exec_context(
     conversation_id: &ConversationId,
     model_id: &str,
     subagents_disabled: bool,
-    overrides: &[(
-        crate::model::SubagentKind,
-        crate::model::SubagentModelOverride,
-    )],
+    overrides: &std::collections::HashMap<String, crate::model::SubagentModelOverride>,
 ) -> ExecContext {
-    let subagent_model = overrides.first().map(|(_, value)| match value {
-        crate::model::SubagentModelOverride::Explicit(model) => {
-            SubagentModel::Model(model.model_id.clone())
-        }
-        crate::model::SubagentModelOverride::Inherit => SubagentModel::Model(model_id.into()),
-        crate::model::SubagentModelOverride::Disabled => SubagentModel::Disabled,
-    });
+    let subagent_models = overrides
+        .iter()
+        .map(|(kind, value)| {
+            let model = match value {
+                crate::model::SubagentModelOverride::Explicit(model) => {
+                    SubagentModel::Model(model.model_id.clone())
+                }
+                crate::model::SubagentModelOverride::Inherit => {
+                    SubagentModel::Model(model_id.into())
+                }
+                crate::model::SubagentModelOverride::Disabled => SubagentModel::Disabled,
+            };
+            (kind.clone(), model)
+        })
+        .collect();
     ExecContext {
         conversation_id: conversation_id.to_string(),
         root_conversation_id: request
@@ -616,7 +637,7 @@ fn exec_context(
             .clone()
             .unwrap_or_else(|| conversation_id.to_string()),
         default_subagent_model: model_id.into(),
-        subagent_model,
+        subagent_models,
         allow_subagents: request.subagent_type_name.is_none() && !subagents_disabled,
         subagents_disabled,
         terminals_folder: request_context

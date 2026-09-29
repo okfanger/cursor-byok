@@ -160,6 +160,11 @@ export interface CommitSettingsView extends CommitSettings {
   default_prompt: string;
 }
 
+/** 子 Agent 模型路由:kind → 已配置模型的稳定 ID（内建 model_hash 或插件模型 id）。 */
+export interface SubagentRouteSettings {
+  routes: Record<string, string>;
+}
+
 export interface TokenPricingSettings {
   input_per_million: number;
   output_per_million: number;
@@ -551,6 +556,8 @@ export const api = {
   setDesktopSettings: (settings: DesktopSettings) => request<DesktopSettings>("/settings/desktop", { method: "PUT", body: JSON.stringify(settings) }),
   commitSettings: (locale: Locale) => request<CommitSettingsView>("/settings/commit", { headers: { "accept-language": locale } }),
   setCommitSettings: (settings: CommitSettings) => request<CommitSettingsView>("/settings/commit", { method: "PUT", body: JSON.stringify(settings) }),
+  subagentRoutes: () => request<SubagentRouteSettings>("/settings/subagent-routes"),
+  setSubagentRoutes: (settings: SubagentRouteSettings) => request<SubagentRouteSettings>("/settings/subagent-routes", { method: "PUT", body: JSON.stringify(settings) }),
   pricingSettings: () => request<TokenPricingSettings>("/settings/pricing"),
   setPricingSettings: (settings: TokenPricingSettings) => request<TokenPricingSettings>("/settings/pricing", { method: "PUT", body: JSON.stringify(settings) }),
 };

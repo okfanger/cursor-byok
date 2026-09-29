@@ -43,7 +43,7 @@ pub struct ExecContext {
     pub conversation_id: String,
     pub root_conversation_id: String,
     pub default_subagent_model: String,
-    pub subagent_model: Option<SubagentModel>,
+    pub subagent_models: HashMap<String, SubagentModel>,
     pub allow_subagents: bool,
     pub subagents_disabled: bool,
     pub terminals_folder: String,
@@ -66,29 +66,40 @@ pub enum SubagentModel {
 }
 
 impl ExecContext {
+    fn task_subagent_kind<'a>(&self, call: &'a ToolCall) -> &'a str {
+        call.arguments
+            .get("subagent_type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.trim().is_empty())
+            .unwrap_or("generalPurpose")
+    }
+
     pub fn task_disabled(&self, call: &ToolCall) -> bool {
         if !call.name.eq_ignore_ascii_case("Task") {
             return false;
         }
-        self.subagents_disabled || matches!(self.subagent_model, Some(SubagentModel::Disabled))
+        if self.subagents_disabled {
+            return true;
+        }
+        matches!(
+            self.subagent_models.get(self.task_subagent_kind(call)),
+            Some(SubagentModel::Disabled)
+        )
     }
 
     pub fn prepare_call(&self, call: &ToolCall) -> Result<ToolCall> {
         if !call.name.eq_ignore_ascii_case("Task") {
             return Ok(call.clone());
         }
+        let subagent_type = self.task_subagent_kind(call).to_owned();
         let arguments = call
             .arguments
             .as_object()
             .ok_or_else(|| Error::Protocol("Task arguments must be a JSON object".into()))?;
-        let subagent_type = arguments
-            .get("subagent_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("generalPurpose");
         if self.task_disabled(call) {
             return Ok(call.clone());
         }
-        let model = match &self.subagent_model {
+        let model = match self.subagent_models.get(&subagent_type) {
             Some(SubagentModel::Model(model)) => model.clone(),
             Some(SubagentModel::Disabled) => unreachable!("disabled Task returned above"),
             None => arguments
@@ -364,4 +375,93 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn task_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "call-task".into(),
+            model_call_id: "model:0".into(),
+            name: "Task".into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+            argument_error: None,
+        }
+    }
+
+    fn exec_context(models: Vec<(&str, SubagentModel)>) -> ExecContext {
+        ExecContext {
+            conversation_id: "conversation".into(),
+            root_conversation_id: "conversation".into(),
+            default_subagent_model: "root-model".into(),
+            subagent_models: models
+                .into_iter()
+                .map(|(kind, model)| (kind.to_owned(), model))
+                .collect(),
+            allow_subagents: true,
+            subagents_disabled: false,
+            terminals_folder: String::new(),
+            admin_command_denylist: Vec::new(),
+            mcp_routes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn task_model_is_resolved_per_subagent_kind() {
+        let context = exec_context(vec![
+            ("explore", SubagentModel::Model("model-a".into())),
+            ("review", SubagentModel::Model("model-b".into())),
+        ]);
+
+        let explore = context
+            .prepare_call(&task_call(json!({
+                "subagent_type": "explore",
+                "model": "model-c"
+            })))
+            .expect("explore call should prepare");
+        let review = context
+            .prepare_call(&task_call(json!({
+                "subagent_type": "review",
+                "model": "model-c"
+            })))
+            .expect("review call should prepare");
+
+        assert_eq!(explore.arguments["model"], "model-a");
+        assert_eq!(review.arguments["model"], "model-b");
+    }
+
+    #[test]
+    fn unlisted_subagent_kind_keeps_call_model_then_default() {
+        let context = exec_context(vec![("explore", SubagentModel::Model("model-a".into()))]);
+
+        let with_model = context
+            .prepare_call(&task_call(json!({
+                "subagent_type": "generalPurpose",
+                "model": "requested-model"
+            })))
+            .expect("call should prepare");
+        let without_model = context
+            .prepare_call(&task_call(json!({ "subagent_type": "generalPurpose" })))
+            .expect("call should prepare");
+
+        assert_eq!(with_model.arguments["model"], "requested-model");
+        assert_eq!(without_model.arguments["model"], "root-model");
+    }
+
+    #[test]
+    fn disabled_kind_disables_only_its_own_task_calls() {
+        let context = exec_context(vec![("explore", SubagentModel::Disabled)]);
+
+        assert!(context.task_disabled(&task_call(json!({
+            "subagent_type": "explore"
+        }))));
+        assert!(!context.task_disabled(&task_call(json!({
+            "subagent_type": "review"
+        }))));
+    }
 }
